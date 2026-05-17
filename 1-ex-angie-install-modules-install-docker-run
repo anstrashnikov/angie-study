@@ -1,0 +1,183 @@
+установка происходит на ред ос 8.0.2
+
+УПРАЖНЕНИЕ 1
+
+Создание репозитория:
+touch /etc/yum.repos.d/angie.repo
+nano /etc/yum.repos.d/angie.repo
+cat /etc/yum.repos.d/angie.repo
+[angie]
+name=Angie repo
+baseurl=https://download.angie.software/angie/redos/$releasever/
+gpgcheck=1
+enabled=1
+gpgkey=https://angie.software/keys/angie-signing.gpg.asc
+инсталляция angie и модулей
+dnf install -y angie
+dnf install -y angie-module-image-filter
+dnf install -y angie-console-light
+systemctl enable angie
+systemctl start angie
+
+Редактирование файла angie.conf
+
+nano /etc/angie/angie.conf
+
+user  angie;
+
+load_module modules/ngx_http_image_filter_module.so;
+
+worker_processes  auto;
+worker_rlimit_nofile 65536;
+
+error_log  /var/log/angie/error.log notice;
+pid        /run/angie.pid;
+
+events {
+    worker_connections  65536;
+}
+
+http {
+    include       /etc/angie/mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    log_format extended '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" rt="$request_time" '
+                        '"$http_user_agent" "$http_x_forwarded_for" '
+                        'h="$host" sn="$server_name" ru="$request_uri" u="$uri" '
+                        'ucs="$upstream_cache_status" ua="$upstream_addr" us="$upstream_status" '
+                        'uct="$upstream_connect_time" urt="$upstream_response_time"';
+
+    access_log  /var/log/angie/access.log  main;
+
+    sendfile        on;
+    #tcp_nopush     on;
+
+    keepalive_timeout  65;
+
+    #gzip  on;
+
+    include /etc/angie/http.d/*.conf;
+
+server {
+        listen 81;
+        location /console/ {
+        # define list of trusted hosts or networks
+        # allow 127.0.0.1;
+        allow 0.0.0.0/0;
+        # allow 10.0.0.0/8;
+        deny all;
+
+        auto_redirect on;
+
+        alias /usr/share/angie-console-light/html/;
+        index index.html;
+
+        location /console/api/ {
+            api /status/;
+        }
+
+        # uncomment below lines to enable writable API
+        # location /console/api/config/ {
+        #     api /config/;
+        # }
+        }
+       }
+
+}
+
+после этого проверка конфигурации и перезагрузка конфигурации:
+
+angie -t && sudo systemctl reload angie
+
+в итоге сам angie доступен по http://ipadress, консоль доступна http://ipadress:81/console/
+
+
+____________________________________________________________________________________________________________
+
+
+УПРАЖНЕНИЕ 2
+
+установка докера
+
+dnf install docker-ce docker-ce-cli
+systemctl enable docker --now
+systemctl status docker
+
+создание каталога для файла конфигурации angie: mkdir /var/angie-docker-conf/
+
+копирование файла angie.conf в /var/angie-docker-conf/
+
+cat /var/angie-docker-conf/angie.conf
+
+user  angie;
+
+worker_processes  auto;
+worker_rlimit_nofile 65536;
+
+error_log  /var/log/angie/error.log notice;
+pid        /run/angie.pid;
+
+events {
+    worker_connections  65536;
+}
+
+http {
+    include       /etc/angie/mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    log_format extended '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" rt="$request_time" '
+                        '"$http_user_agent" "$http_x_forwarded_for" '
+                        'h="$host" sn="$server_name" ru="$request_uri" u="$uri" '
+                        'ucs="$upstream_cache_status" ua="$upstream_addr" us="$upstream_status" '
+                        'uct="$upstream_connect_time" urt="$upstream_response_time"';
+
+    access_log  /var/log/angie/access.log  main;
+
+    sendfile        on;
+    #tcp_nopush     on;
+
+    keepalive_timeout  65;
+
+    #gzip  on;
+
+    include /etc/angie/http.d/*.conf;
+
+}
+
+запуск докера с пробросом конфига с хоста и мапингом портов
+
+docker run --rm --name angie -v /var/angie-docker-conf/angie.conf:/etc/angie/angie.conf:ro -p 8080:80 -d docker.angie.software/angie:latest
+
+после этого хостовой комп слушает порт 8080
+
+ss -tulpn | grep 8080
+tcp   LISTEN 0      4096         0.0.0.0:8080       0.0.0.0:*    users:(("docker-proxy",pid=3473,fd=7))                                            
+tcp   LISTEN 0      4096            [::]:8080          [::]:*    users:(("docker-proxy",pid=3479,fd=7))            
+
+также настроен мапинг в iptables:
+
+iptables -nvL | grep dpt:80
+    2   120 ACCEPT     6    --  !docker0 docker0  0.0.0.0/0            172.17.0.2           tcp dpt:80
+
+ps aux | grep docker
+root        2966  0.1  4.5 2173908 90720 ?       Ssl  15:43   0:04 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+root        3473  0.0  0.2 1599244 4900 ?        Sl   16:32   0:00 /usr/bin/docker-proxy -proto tcp -host-ip 0.0.0.0 -host-port 8080 -container-ip 172.17.0.2 -container-port 80 -use-listen-fd
+root        3479  0.0  0.2 1599244 4996 ?        Sl   16:32   0:00 /usr/bin/docker-proxy -proto tcp -host-ip :: -host-port 8080 -container-ip 172.17.0.2 -container-port 80 -use-listen-fd
+root        3549  0.0  0.1   6272  2476 pts/0    S+   16:48   0:00 grep --color=auto docker
+
+
+при обращение на http://ipхостовогокомпа:8080 попадаем на дефолтовую страницу angie в докере
+
+
+
+

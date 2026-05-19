@@ -1,0 +1,242 @@
+Упражнение выполняется на red os 8.0.2
+
+1-Установка nginx с конфигами из материалов к лабе
+
+dnf install nginx
+systemctl enable nginx
+копирование конфигов в папку /etc/nginx c заменой существующих
+nginx -t говорит, что нет пользователя www-data в системе.
+useradd -r -s /sbin/nologin www-data
+создание каталога /var/www/html и копирование туда файлов из конфига к лабе
+меняем владельца у каталогов
+chown -R www-data:www-data /var/log/nginx
+chown -R www-data:www-data /var/lib/nginx
+chown -R www-data:www-data /var/www/html
+nginx -t говорит, что brotli неизвестная директива
+находим доступные для установки модули nginx
+dnf search nginx
+dnf install nginx-mod-brotli.x86_64
+cat /usr/share/nginx/modules/mod-brotli.conf
+
+Добавляем эти строчки в файл /etc/nginx/nginx.conf
+load_module "/usr/lib64/nginx/modules/ngx_http_brotli_filter_module.so";
+load_module "/usr/lib64/nginx/modules/ngx_http_brotli_static_module.so";
+
+далее меняем в /etc/nginx/nginx.conf строчку include /etc/nginx/sites-enabled/* на /etc/nginx/sites-available/* так как там есть файл default
+в файле /etc/nginx/sites-available/default удаляем комментим все, что связано с upstream backend 
+cat /etc/nginx/sites-available/default
+#upstream backend {
+#    #hash $request_uri;
+#    server 127.0.0.1:9000 weight=2;
+#    server 127.0.0.1:9001 weight=5;
+#    server 127.0.0.1:9002 weight=8;
+#    server 127.0.0.1:9003 weight=4 fail_timeout=5s;
+#}
+
+server {
+	listen 80 default_server;
+	listen [::]:80 default_server;
+
+	root /var/www/html;
+
+	index index.html index.htm index.nginx-debian.html;
+
+	server_name _;
+	
+	access_log /var/log/nginx/default.log;
+
+	location / {
+		#proxy_cache one;
+	    proxy_cache_valid 200 1h;
+	    proxy_cache_lock on;
+	    proxy_cache_use_stale updating error timeout invalid_header http_500 http_502 http_504;
+	    proxy_cache_background_update on;
+		#proxy_pass	http://127.0.0.1:8008;
+#		proxy_pass	http://backend;
+		#try_files $uri $uri/ =404;
+	}
+
+	location /stat {
+		include         uwsgi_params;
+		uwsgi_pass      127.0.0.1:81;
+	}
+
+  # Static files location
+  location ~* \.(jpg|jpeg|gif|png)$ {
+        include /etc/nginx/static-avif.conf;
+  }
+
+  # Static files location
+  location ~* \.(ttf|eot|svg|woff|woff2|css|js|json|ico|zip|tgz|gz|rar|bz2|doc|docx|xlsx|pptx|xls|exe|pdf|ppt|txt|tar|mid|midi|wav|bmp|rtf|avi|swf|flv|mp3|mp4|fla)$ {
+		expires max;
+        include /etc/nginx/static.conf;
+  }
+
+
+	location ~ \.php$ {
+		include snippets/fastcgi-php.conf;
+		# With php-fpm (or other unix sockets):
+		fastcgi_pass unix:/run/php/php8.1-fpm.sock;
+	#	# With php-cgi (or other tcp sockets):
+	#	fastcgi_pass 127.0.0.1:9000;
+	}
+}
+nginx -t проходит без ошибок
+
+systemctl nginx start
+
+на адресс http://iphost выдается страница по умолчанию.
+
+ss -tulpn
+Netid          State           Recv-Q          Send-Q                    Local Address:Port                      Peer Address:Port          Process                                                                                      
+udp            UNCONN          0               0                            127.0.0.54:53                             0.0.0.0:*              users:(("systemd-resolve",pid=510,fd=18))                                                   
+udp            UNCONN          0               0                         127.0.0.53%lo:53                             0.0.0.0:*              users:(("systemd-resolve",pid=510,fd=16))                                                   
+udp            UNCONN          0               0                               0.0.0.0:5355                           0.0.0.0:*              users:(("systemd-resolve",pid=510,fd=10))                                                   
+udp            UNCONN          0               0                             127.0.0.1:323                            0.0.0.0:*              users:(("chronyd",pid=556,fd=5))                                                            
+udp            UNCONN          0               0                                  [::]:5355                              [::]:*              users:(("systemd-resolve",pid=510,fd=12))                                                   
+udp            UNCONN          0               0                                 [::1]:323                               [::]:*              users:(("chronyd",pid=556,fd=6))                                                            
+tcp            LISTEN          0               4096                            0.0.0.0:5355                           0.0.0.0:*              users:(("systemd-resolve",pid=510,fd=11))                                                   
+tcp            LISTEN          0               511                             0.0.0.0:80                             0.0.0.0:*              users:(("nginx",pid=1841,fd=9),("nginx",pid=1840,fd=9),("nginx",pid=1839,fd=9))             
+tcp            LISTEN          0               128                             0.0.0.0:22                             0.0.0.0:*              users:(("sshd",pid=590,fd=7))                                                               
+tcp            LISTEN          0               4096                      127.0.0.53%lo:53                             0.0.0.0:*              users:(("systemd-resolve",pid=510,fd=17))                                                   
+tcp            LISTEN          0               4096                         127.0.0.54:53                             0.0.0.0:*              users:(("systemd-resolve",pid=510,fd=19))                                                   
+tcp            LISTEN          0               4096                          127.0.0.1:46495                          0.0.0.0:*              users:(("containerd",pid=596,fd=9))                                                         
+tcp            LISTEN          0               100                           127.0.0.1:25                             0.0.0.0:*              users:(("master",pid=783,fd=13))                                                            
+tcp            LISTEN          0               4096                               [::]:5355                              [::]:*              users:(("systemd-resolve",pid=510,fd=13))                                                   
+tcp            LISTEN          0               511                                [::]:80                                [::]:*              users:(("nginx",pid=1841,fd=10),("nginx",pid=1840,fd=10),("nginx",pid=1839,fd=10))          
+tcp            LISTEN          0               128                                [::]:22                                [::]:*              users:(("sshd",pid=590,fd=8))                                                               
+tcp            LISTEN          0               100                               [::1]:25                                [::]:*              users:(("master",pid=783,fd=14))     
+
+________________________________________________________________________________________________________________________________-
+
+2 - Установка Angie копирование конфигов nginx на angie, отключение nginx и запуск angie
+
+dnf install angie
+dnf search angie | grep brotli
+dnf install angie-module-brotli.x86_64
+
+сравниваем существующие файлы в /etc/angie и файлы конфигов nginx, приходим к выводу, что файлы:
+
+-rw-r--r-- 1 root root  1086 мая 14 20:45 fastcgi.conf
+-rw-r--r-- 1 root root  1016 мая 14 20:45 fastcgi_params
+-rw-r--r-- 1 root root  5354 мая 14 20:45 mime.types
+-rw-r--r-- 1 root root   645 мая 14 20:45 scgi_params
+-rw-r--r-- 1 root root   673 мая 14 20:45 uwsgi_params
+
+заменять не имеет смысла.
+
+копируем в /etc/angie/ каталоги sites-available, snipets, файлы koi-utf, koi-win, proxy_params, win-utf, static-avif.conf, static.conf.
+
+добавляем в файл /etc/angie/angie.conf необходмые параметры
+
+user www-data;
+
+load_module modules/ngx_http_brotli_filter_module.so;
+load_module modules/ngx_http_brotli_static_module.so;
+
+sendfile on;
+tcp_nopush on;
+types_hash_max_size 2048;
+
+proxy_cache_valid 1m;
+proxy_cache_key $scheme$host$request_uri;
+proxy_cache_path /var/www/cache levels=1:2 keys_zone=one:10m inactive=48h max_size=800m;
+
+##
+# SSL Settings
+##
+
+ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3; # Dropping SSLv3, ref: POODLE
+ssl_prefer_server_ciphers on;
+
+#
+	# Gzip Settings
+	##
+
+	gzip on;
+
+	gzip_vary on;
+	gzip_proxied any;
+	gzip_comp_level 6;
+	gzip_buffers 16 8k;
+	gzip_http_version 1.1;
+	gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+
+    brotli_static		on;
+    brotli				on;
+    brotli_comp_level	5;
+    brotli_types		text/plain text/css text/xml application/javascript application/json image/x-icon image/svg+xml;
+
+    #zstd 			on;
+    #zstd_min_length 	256;
+    #zstd_comp_level 	5;
+    #zstd_static 		on;
+    #zstd_types			text/plain text/css text/xml application/javascript application/json image/x-icon image/svg+xml;
+
+    map $http_accept $webp_suffix {
+        "~*webp"  ".webp";
+    }
+
+    map $http_accept $avif_suffix {
+        "~*avif"  ".avif";
+        "~*webp"  ".webp";
+    }
+
+    map $msie $cache_control {
+      default "max-age=31536000, public, no-transform, immutable";
+        "1"     "max-age=31536000, private, no-transform, immutable";
+    }
+
+    map $msie $vary_header {
+	default "Accept";
+	"1"     "";
+    }
+
+Меняем в файле /etc/angie/sites-available/default 
+
+все пути с /etc/nginx на /etc/angie, и путь до логов на /var/log/angie/angie.log;
+
+меняем владельца для логов
+
+chown -R www-data:www-data /var/log/angie
+angie -t
+angie: the configuration file /etc/angie/angie.conf syntax is ok
+angie: configuration file /etc/angie/angie.conf test is successful
+
+systemctl disable nginx
+Removed "/etc/systemd/system/multi-user.target.wants/nginx.service".
+systemctl stop nginx
+systemctl enable angie
+systemctl start angie
+systemctl status angie
+ystemctl status angie
+● angie.service - Angie - high performance web server
+     Loaded: loaded (/usr/lib/systemd/system/angie.service; enabled; preset: disabled)
+    Drop-In: /usr/lib/systemd/system/service.d
+             └─10-timeout-abort.conf
+     Active: active (running) since Wed 2026-05-20 00:01:29 MSK; 2min 26s ago
+       Docs: https://en.angie.software/angie/docs/
+    Process: 2769 ExecStart=/usr/sbin/angie -c /etc/angie/angie.conf (code=exited, status=0/SUCCESS)
+   Main PID: 2770 (angie)
+      Tasks: 4 (limit: 2275)
+     Memory: 58.5M
+        CPU: 47ms
+     CGroup: /system.slice/angie.service
+             ├─2770 "angie: master process v1.11.5 #1 [/usr/sbin/angie -c /etc/angie/angie.conf]"
+             ├─2771 "angie: worker process #1"
+             ├─2772 "angie: worker process #1"
+             └─2773 "angie: cache manager process #1"
+
+мая 20 00:01:29 vm1 systemd[1]: Starting angie.service - Angie - high performance web server...
+мая 20 00:01:29 vm1 systemd[1]: Started angie.service - Angie - high performance web server.
+
+при заходе на http://ipадрес хоста получаем ту же html страницу, что и у angie
+
+
+
+
+
+
+
+
+

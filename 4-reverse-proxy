@@ -1,0 +1,143 @@
+Упражнение выполняется на хосте с ред ос 8.0.2. В хостой ОС установен angie как reverse proxy для wordpress, который на этом же хосте запускается в докере вместе с базой.
+
+Ставим докер с поддержкой compose
+
+dnf install docker.io
+dnf install docker-ce docker-ce-cli
+dnf install docker-compose.x86_64
+systemctl enable docker --now
+
+готовим docker-compose.yaml. Так как нужно разделить обработку статических и динамических запросов, то необходимо содержимое wordpress сделать доступным на хостовой ОС. Для этого делаем мапинг путей между хостовой ОС и докером
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: wordpress_db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: 123456
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wp_user
+      MYSQL_PASSWORD: 12345678
+    volumes:
+      - db_data:/var/lib/mysql
+    networks:
+      - wp_network
+
+  wordpress:
+    image: wordpress:latest
+    container_name: wordpress_app
+    restart: always
+    ports:
+      - "8080:80"
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_USER: wp_user
+      WORDPRESS_DB_PASSWORD: 12345678
+      WORDPRESS_DB_NAME: wordpress
+    volumes:
+      - /var/www/wordpress:/var/www/html
+    networks:
+      - wp_network
+    depends_on:
+      - db
+
+volumes:
+  db_data:
+  wp_data:
+
+networks:
+  wp_network:
+    driver: bridge
+
+После этого приступаем к настройке angie. 
+
+нам нужен только файл /etc/angie/http.d/default.conf
+
+upstream wordpress_docker {
+    server 127.0.0.1:8080;
+    zone wp_backend_zone 64k;
+}
+
+server {
+    listen       80;
+    server_name  localhost;
+
+    #access_log  /var/log/angie/host.access.log  main;
+
+    # 1. ОБРАБОТКА СТАТИКИ
+    
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|otf|webp|mp4|webm)$ {
+        # Пытаемся найти файл на диске хоста. Если нет — отдаем 404
+        try_files $uri =404;
+        
+        
+        expires 365d;
+        
+        
+        access_log off;
+        log_not_found off;
+        
+        
+        add_header Cache-Control "public, no-transform";
+    }
+
+    # 2. ОБРАБОТКА ДИНАМИКИ (Все остальные запросы)
+    location / {
+        # Если запрашиваемого файла/папки нет на диске,
+        # запрос перенаправляется на index.php, который уходит в Docker
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    # 3. ПРОКСИРОВАНИЕ PHP-ЗАПРОСОВ В DOCKER
+    
+    location ~ \.php$ {
+        proxy_pass http://wordpress_docker;
+
+       
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+    }
+    
+    # Корневая папка с wordpress на хостовой ОС
+    root   /var/www/wordpress;
+    index  index.php;
+    
+
+    location /status/ {
+        api     /status/;
+        allow   127.0.0.1;
+        deny    all;
+    }
+
+    
+    
+    
+    # redirect server error pages to the static page /50x.html
+    #
+    error_page   500 502 503 504  /50x.html;
+    location = /50x.html {
+        root   /usr/share/angie/html;
+    }
+
+
+    # deny access to .htaccess files, if Apache's document root
+    # concurs with angie's one
+    #
+    location ~ /\.ht {
+        deny  all;
+    }
+}
+
+проверяем angie -t
+
+systemctl restart angie
+
+В результате на идя по адресу http://ipхостовой ОС - получаем wordpress конфигуратор сайта.
+

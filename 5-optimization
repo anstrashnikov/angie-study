@@ -1,0 +1,316 @@
+Для ДЗ используем результат предыдущей ДЗ 4. У нас имеет angie в хостовой ОС ред ос 8.0.2. Два докера с wordpress и mysql. Используем http без TLS.
+
+1) Возможности клиенской оптимизации.
+
+    в файле /etc/angie.conf в секции http добавляем строки
+
+    sendfile       on; # Прямая передача файлов в обход буфера приложений
+    tcp_nopush     on; # Отправление заголовков HTTP ответа и начало файла в одном сетевом пакете TCP
+    tcp_nodelay    on; # Отправка данные без заполнения буфера пакета в keepalive.
+    keepalive_timeout  65; 
+    keepalive_requests 1000;
+
+    #Сжатие файлов через gzip
+    
+    gzip  on;
+    gzip_comp_level 5;
+    gzip_min_length 256; # Не сжимаем файлы меньше 256 байт
+    gzip_proxied any;    # Сжимать запросы, идущие через прокси
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml xml/javascript;
+
+   # Адаптивная доставка изображений . Добавляем переменную $img_suffix
+
+        map $http_accept $img_suffix {
+        # Сначала проверяем AVIF (как самый эффективный)
+        "~*image/avif"  ".avif";
+        # Если AVIF не поддерживается, проверяем WebP
+        "~*image/webp"  ".webp";
+        # Для всех остальных браузеров переменная будет пустой
+        default         "";
+    }
+
+   в файле /etc/http.d/default.conf в секции Server добавляем 
+
+    # АДАПТИВНАЯ СТАТИКА (Высший приоритет для картинок из uploads)
+    # Перехватываем только загруженные пользователем изображения для подмены формата
+      location ~* ^/wp-content/uploads/(.+)\.(png|jpg|jpeg)$ {
+      add_header Vary Accept;
+      expires 365d;
+      add_header Cache-Control "public, no-transform";
+    
+    # Ищем оптимизированный формат, затем оригинал. Если файла вообще нет — отдаем 404
+      try_files /wp-content/uploads/$1.$2$img_suffix /wp-content/uploads/$1.$2 =404;
+      }
+
+2) Настроить серверное кэширование.
+
+в файле /etc/angie.conf в секции http добавляем строки
+
+    # Определяем настройки кэширования     
+
+    proxy_cache_path /var/www/cache levels=1:2 keys_zone=WP_HTTP_CACHE:50m max_size=2g inactive=60m use_temp_path=off;
+    
+    # Создаем переменную $no_cache cо значениями 0, когда можно отдавть страницу из КЭШ и 1, когда кэш не используется.    
+
+    map $http_cookie $no_cache {
+        default 0;
+        ~comment_author_ 1; # Если пользователь оставил комментарий, не использовать кэш.
+        ~wordpress_logged_in_ 1; # Если пользователь залогинился под своей УЗ, не использовать кэш
+        ~wp-postpass 1; # Отключать КЭШ для страниц с паролем
+    }
+
+в файле /etc/http.d/default.conf в секции Server добавляем 
+
+
+        # Активируем КЭШ.
+
+        proxy_cache WP_HTTP_CACHE;
+        proxy_cache_key "$scheme$request_method$host$request_uri";
+        
+        # Разрешаем использовать старый кэш, если WordPress временно упал или занят
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        proxy_cache_background_update on; # Обновление кэша в фоне
+        
+        # Если 100 пользователей одновременно запросят одну и ту же страницу, 
+        # Angie сделает только 1 запрос к WordPress, а остальным отдаст ответ из кэша
+        proxy_cache_lock on; 
+        
+        # Проверяем куки (не кэшируем админку)
+        proxy_cache_bypass $no_cache;
+        proxy_no_cache $no_cache;
+
+___________________________________________________________
+
+текст файл настроек:
+
+cat angie.conf
+user  angie;
+worker_processes  auto;
+worker_rlimit_nofile 65536;
+
+error_log  /var/log/angie/error.log notice;
+pid        /run/angie.pid;
+
+events {
+    worker_connections  65536;
+}
+
+
+http {
+    include       /etc/angie/mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    log_format extended '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" rt="$request_time" '
+                        '"$http_user_agent" "$http_x_forwarded_for" '
+                        'h="$host" sn="$server_name" ru="$request_uri" u="$uri" '
+                        'ucs="$upstream_cache_status" ua="$upstream_addr" us="$upstream_status" '
+                        'uct="$upstream_connect_time" urt="$upstream_response_time"';
+
+    access_log  /var/log/angie/access.log  main;
+
+    proxy_cache_path /var/www/cache levels=1:2 keys_zone=WP_HTTP_CACHE:50m max_size=2g inactive=60m use_temp_path=off;
+    
+    
+    map $http_cookie $no_cache {
+        default 0;
+        ~comment_author_ 1;
+        ~wordpress_logged_in_ 1;
+        ~wp-postpass 1;
+    }
+    
+    map $http_accept $img_suffix {
+        # Сначала проверяем AVIF (как самый эффективный)
+        "~*image/avif"  ".avif";
+        # Если AVIF не поддерживается, проверяем WebP
+        "~*image/webp"  ".webp";
+        # Для всех остальных браузеров переменная будет пустой
+        default         "";
+    }
+
+    sendfile        on;
+    tcp_nopush     on;
+    tcp_nodelay    on;
+    keepalive_timeout  65;
+    keepalive_requests 1000;
+
+    gzip  on;
+    gzip_comp_level 5;
+    gzip_min_length 256; # Не сжимаем файлы меньше 256 байт
+    gzip_proxied any;    # Сжимать запросы, идущие через прокси
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml xml/javascript;
+    
+    include /etc/angie/http.d/*.conf;
+}
+
+#stream {
+#    include /etc/angie/stream.d/*.conf;
+#}
+
+
+[root@vm1 angie]# cd http.d/
+[root@vm1 http.d]# cat default.conf 
+upstream wordpress_docker {
+    server 127.0.0.1:8080;
+    zone wp_backend_zone 64k;
+}
+
+server {
+    listen       80;
+    server_name  localhost;
+
+    #access_log  /var/log/angie/host.access.log  main;
+     
+    # 1. АДАПТИВНАЯ СТАТИКА (Высший приоритет для картинок из uploads)
+    # Перехватываем только загруженные пользователем изображения для подмены формата
+      location ~* ^/wp-content/uploads/(.+)\.(png|jpg|jpeg)$ {
+      add_header Vary Accept;
+      expires 365d;
+      add_header Cache-Control "public, no-transform";
+    
+    # Ищем оптимизированный формат, затем оригинал. Если файла вообще нет — отдаем 404
+      try_files /wp-content/uploads/$1.$2$img_suffix /wp-content/uploads/$1.$2 =404;
+      }
+
+    # 2. ОБРАБОТКА Общей  СТАТИКИ
+    
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|otf|webp|avif|mp4|webm)$ {
+        # Пытаемся найти файл на диске хоста. Если нет — отдаем 404
+        try_files $uri =404;
+        
+        
+        expires 365d;
+        
+        
+        access_log off;
+        log_not_found off;
+        
+        # Добавляем заголовки кэширования
+        add_header Cache-Control "public, no-transform";
+    }
+
+    # 3. ОБРАБОТКА ДИНАМИКИ (Все остальные запросы)
+    location / {
+        # Если запрашиваемого файла/папки нет на диске,
+        # запрос перенаправляется на index.php, который уходит в Docker
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    # 4. ПРОКСИРОВАНИЕ PHP-ЗАПРОСОВ В DOCKER
+    
+    location ~ \.php$ {
+        proxy_pass http://wordpress_docker;
+
+        # Стандартные заголовки проксирования
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+
+        proxy_cache WP_HTTP_CACHE;
+        proxy_cache_key "$scheme$request_method$host$request_uri";
+        
+        # Разрешаем использовать старый кэш, если WordPress временно упал или занят
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        proxy_cache_background_update on; # Обновление кэша в фоне
+        
+        # Если 100 пользователей одновременно запросят одну и ту же страницу, 
+        # Angie сделает только 1 запрос к WordPress, а остальным отдаст ответ из кэша
+        proxy_cache_lock on; 
+        
+        # Проверяем куки (не кэшируем админку)
+        proxy_cache_bypass $no_cache;
+        proxy_no_cache $no_cache;
+    }
+    
+    # Корневая папка с wordpress на хостовой ОС
+    root   /var/www/wordpress;
+    index  index.php;
+    
+
+    location /status/ {
+        api     /status/;
+        allow   127.0.0.1;
+        deny    all;
+    }
+
+    
+    
+    
+    # redirect server error pages to the static page /50x.html
+    #
+    error_page   500 502 503 504  /50x.html;
+    location = /50x.html {
+        root   /usr/share/angie/html;
+    }
+
+
+    # deny access to .htaccess files, if Apache's document root
+    # concurs with angie's one
+    #
+    location ~ /\.ht {
+        deny  all;
+    }
+}
+
+angie -t
+angie: the configuration file /etc/angie/angie.conf syntax is ok
+angie: configuration file /etc/angie/angie.conf test is successful
+
+systemctl restart angie
+[root@vm1 http.d]# systemctl status angie
+● angie.service - Angie - high performance web server
+     Loaded: loaded (/usr/lib/systemd/system/angie.service; enabled; preset: disabled)
+    Drop-In: /usr/lib/systemd/system/service.d
+             └─10-timeout-abort.conf
+     Active: active (running) since Wed 2026-06-17 14:48:00 MSK; 10s ago
+       Docs: https://en.angie.software/angie/docs/
+    Process: 1562 ExecStart=/usr/sbin/angie -c /etc/angie/angie.conf (code=exited, status=0/SUCCESS)
+   Main PID: 1563 (angie)
+      Tasks: 5 (limit: 2275)
+     Memory: 59.2M
+        CPU: 37ms
+     CGroup: /system.slice/angie.service
+             ├─1563 "angie: master process v1.11.6 #1 [/usr/sbin/angie -c /etc/angie/angie.conf]"
+             ├─1564 "angie: worker process #1"
+             ├─1565 "angie: worker process #1"
+             ├─1566 "angie: cache manager process #1"
+             └─1567 "angie: cache loader process #1"
+
+июн 17 14:48:00 vm1 systemd[1]: Starting angie.service - Angie - high performance web server...
+июн 17 14:48:00 vm1 systemd[1]: Started angie.service - Angie - high performance web server.
+
+ss -tulpn
+Netid      State       Recv-Q      Send-Q           Local Address:Port              Peer Address:Port      Process                                                                               
+udp        UNCONN      0           0                   127.0.0.54:53                     0.0.0.0:*          users:(("systemd-resolve",pid=511,fd=18))                                            
+udp        UNCONN      0           0                127.0.0.53%lo:53                     0.0.0.0:*          users:(("systemd-resolve",pid=511,fd=16))                                            
+udp        UNCONN      0           0                      0.0.0.0:5355                   0.0.0.0:*          users:(("systemd-resolve",pid=511,fd=10))                                            
+udp        UNCONN      0           0                    127.0.0.1:323                    0.0.0.0:*          users:(("chronyd",pid=557,fd=5))                                                     
+udp        UNCONN      0           0                         [::]:5355                      [::]:*          users:(("systemd-resolve",pid=511,fd=12))                                            
+udp        UNCONN      0           0                        [::1]:323                       [::]:*          users:(("chronyd",pid=557,fd=6))                                                     
+tcp        LISTEN      0           4096                   0.0.0.0:8080                   0.0.0.0:*          users:(("docker-proxy",pid=1207,fd=7))                                               
+tcp        LISTEN      0           100                  127.0.0.1:25                     0.0.0.0:*          users:(("master",pid=779,fd=13))                                                     
+tcp        LISTEN      0           4096             127.0.0.53%lo:53                     0.0.0.0:*          users:(("systemd-resolve",pid=511,fd=17))                                            
+tcp        LISTEN      0           4096                127.0.0.54:53                     0.0.0.0:*          users:(("systemd-resolve",pid=511,fd=19))                                            
+tcp        LISTEN      0           4096                 127.0.0.1:34467                  0.0.0.0:*          users:(("containerd",pid=587,fd=9))                                                  
+tcp        LISTEN      0           4096                   0.0.0.0:5355                   0.0.0.0:*          users:(("systemd-resolve",pid=511,fd=11))                                            
+tcp        LISTEN      0           511                    0.0.0.0:80                     0.0.0.0:*          users:(("angie",pid=1565,fd=6),("angie",pid=1564,fd=6),("angie",pid=1563,fd=6))      
+tcp        LISTEN      0           128                    0.0.0.0:22                     0.0.0.0:*          users:(("sshd",pid=585,fd=7))                                                        
+tcp        LISTEN      0           4096                      [::]:8080                      [::]:*          users:(("docker-proxy",pid=1212,fd=7))                                               
+tcp        LISTEN      0           100                      [::1]:25                        [::]:*          users:(("master",pid=779,fd=14))                                                     
+tcp        LISTEN      0           4096                      [::]:5355                      [::]:*          users:(("systemd-resolve",pid=511,fd=13))                                            
+tcp        LISTEN      0           128                       [::]:22                        [::]:*          users:(("sshd",pid=585,fd=8))             
+
+
+
+
+
+

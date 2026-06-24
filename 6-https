@@ -1,0 +1,216 @@
+Для ДЗ используем результат предыдущей ДЗ 5. У нас имеет angie в хостовой ОС ред ос 8.0.2. Два докера с wordpress и mysql. Используем http без TLS.
+
+Выпускаем самоподписной сертификат через bash скрипт:
+
+openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
+  -keyout server.key \
+  -out server.crt \
+  -subj "/CN=anstrashnikov.ru" \
+  -addext "subjectAltName=DNS:anstrashnikov.ru,DNS:://anstrashnikov.ru,IP:ipaddress"
+
+Далее создаем каталог /etc/angie/ssl, копируем туда сертификат и закрытый ключ, ограничиваем права. Также добавляем сертификат в доверенные на хост, где установлен angie и откуда будем проверять через браузер и curl. Плюс в файле /etc/hosts создаем создаем запись ipaddress anstrashnikov.ru ://anstrashnikov.ru
+
+sudo cp server.crt /usr/share/pki/ca-trust-source/anchors/angie1.crt
+update-ca-trust
+сd /home/user01
+cd cert
+cp server.crt /etc/angie/ssl/server.crt
+cp server.key /etc/angie/ssl/server.key
+sudo chmod 600 /etc/angie/ssl/server.key
+sudo chmod 644 /etc/angie/ssl/server.crt
+
+Далее модифицируем файл /etc/angie/http.d/default.conf 
+
+cat /etc/angie/http.d/default.conf
+upstream wordpress_docker {
+    server 127.0.0.1:8080;
+    zone wp_backend_zone 64k;
+}
+
+# Cоздаем еще одну директиву server для перенаправления http-https
+server {
+    listen 80;
+    server_name anstrashnikov.ru;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name  anstrashnikov.ru;
+    
+    # Включаем http/2
+    http2 on;
+        
+    # Включаем HTTP/3 (QUIC)
+    listen 443 quic reuseport;
+    
+    access_log  /var/log/angie/host.access.log  main;
+    
+    # --- Пути к сертификатам ---
+    ssl_certificate     /etc/angie/ssl/server.crt;
+    ssl_certificate_key /etc/angie/ssl/server.key;
+
+    # --- Оптимизация и Безопасность TLS ---
+    ssl_prefer_server_ciphers off; # Доверяем современному выбору шифров клиентом
+
+    # Включаем TLS 1.3 0-RTT для ускорения повторных заходов
+    ssl_early_data on;
+
+    # Кэширование SSL-сессий для снижения нагрузки на процессор
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets on;
+
+    # --- Оптимизация SSL-буферов (Динамический размер) ---
+    ssl_buffer_size 4k;
+    
+    # --- Заголовки для HTTP/3 и безопасности ---
+    # Информируем браузер о поддержке H3
+    add_header Alt-Svc 'h3=":443"; ma=86400';
+    # Защита HSTS (принудительный HTTPS для браузера на 1 год)
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+
+
+#Далее отсальные настройки из предыдущих ДЗ
+
+
+     
+    # 1. АДАПТИВНАЯ СТАТИКА (Высший приоритет для картинок из uploads)
+    # Перехватываем только загруженные пользователем изображения для подмены формата
+      location ~* ^/wp-content/uploads/(.+)\.(png|jpg|jpeg)$ {
+      add_header Vary Accept;
+      expires 365d;
+      add_header Cache-Control "public, no-transform";
+    
+    # Ищем оптимизированный формат, затем оригинал. Если файла вообще нет — отдаем 404
+      try_files /wp-content/uploads/$1.$2$img_suffix /wp-content/uploads/$1.$2 =404;
+      }
+
+    # 2. ОБРАБОТКА Общей  СТАТИКИ
+    
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|otf|webp|avif|mp4|webm)$ {
+        # Пытаемся найти файл на диске хоста. Если нет — отдаем 404
+        try_files $uri =404;
+        
+        
+        expires 365d;
+        
+        
+        access_log off;
+        log_not_found off;
+        
+        # Добавляем заголовки кэширования
+        add_header Cache-Control "public, no-transform";
+    }
+
+    # 3. ОБРАБОТКА ДИНАМИКИ (Все остальные запросы)
+    location / {
+     
+        proxy_pass http://wordpress_docker;
+
+        # Стандартные заголовки проксирования
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+
+        proxy_cache WP_HTTP_CACHE;
+        proxy_cache_key "$scheme$request_method$host$request_uri";
+        
+        # Разрешаем использовать старый кэш, если WordPress временно упал или занят
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        proxy_cache_background_update on; # Обновление кэша в фоне
+        
+        # Если 100 пользователей одновременно запросят одну и ту же страницу, 
+        # Angie сделает только 1 запрос к WordPress, а остальным отдаст ответ из кэша
+        proxy_cache_lock on; 
+        
+        # Проверяем куки (не кэшируем админку)
+        proxy_cache_bypass $no_cache;
+        proxy_no_cache $no_cache;
+    }
+    
+    # Корневая папка с wordpress на хостовой ОС
+    root   /var/www/wordpress;
+    index  index.php;
+    
+
+    location /status/ {
+        api     /status/;
+        allow   127.0.0.1;
+        deny    all;
+    }
+
+    
+    
+    
+    # redirect server error pages to the static page /50x.html
+    #
+    error_page   500 502 503 504  /50x.html;
+    location = /50x.html {
+        root   /usr/share/angie/html;
+    }
+
+
+    # deny access to .htaccess files, if Apache's document root
+    # concurs with angie's one
+    #
+    location ~ /\.ht {
+        deny  all;
+    }
+}
+
+angie -t 
+
+systemctl restart angie
+
+
+
+Далее проверяем, что через браузер корректно отрабатывает перенаправление на https. также при curl -IL https://anstrashnikov.ru получаем ответ
+
+curl -I https://anstrashnikov.ru
+HTTP/2 200 
+server: Angie/1.11.8
+date: Wed, 24 Jun 2026 20:34:39 GMT
+content-type: text/html; charset=UTF-8
+x-powered-by: PHP/8.3.31
+link: <https://anstrashnikov.ru/index.php?rest_route=/>; rel="https://api.w.org/"
+vary: Accept-Encoding
+alt-svc: h3=":443"; ma=86400
+strict-transport-security: max-age=31536000
+
+
+проверяем http 1.1
+
+curl -I --http1.1 https://anstrashnikov.ru
+HTTP/1.1 200 OK
+Server: Angie/1.11.8
+Date: Wed, 24 Jun 2026 20:37:43 GMT
+Content-Type: text/html; charset=UTF-8
+Connection: keep-alive
+X-Powered-By: PHP/8.3.31
+Link: <https://anstrashnikov.ru/index.php?rest_route=/>; rel="https://api.w.org/"
+Vary: Accept-Encoding
+Alt-Svc: h3=":443"; ma=86400
+Strict-Transport-Security: max-age=31536000
+
+
+проверяем http 3
+
+ss -tulpn | grep udp
+udp   UNCONN 0      0         127.0.0.54:53         0.0.0.0:*    users:(("systemd-resolve",pid=509,fd=18))                                                                                           
+udp   UNCONN 0      0      127.0.0.53%lo:53         0.0.0.0:*    users:(("systemd-resolve",pid=509,fd=16))                                                                                           
+udp   UNCONN 0      0            0.0.0.0:5355       0.0.0.0:*    users:(("systemd-resolve",pid=509,fd=10))                                                                                           
+udp   UNCONN 0      0          127.0.0.1:323        0.0.0.0:*    users:(("chronyd",pid=555,fd=5))                                                                                                    
+udp   UNCONN 0      0            0.0.0.0:443        0.0.0.0:*    users:(("angie",pid=2744,fd=10),("angie",pid=2743,fd=10),("angie",pid=2742,fd=10),("angie",pid=2741,fd=10),("angie",pid=2740,fd=10))
+udp   UNCONN 0      0            0.0.0.0:443        0.0.0.0:*    users:(("angie",pid=2744,fd=9),("angie",pid=2743,fd=9),("angie",pid=2742,fd=9),("angie",pid=2741,fd=9),("angie",pid=2740,fd=9))     
+udp   UNCONN 0      0               [::]:5355          [::]:*    users:(("systemd-resolve",pid=509,fd=12))                                                                                           
+udp   UNCONN 0      0              [::1]:323           [::]:*    users:(("chronyd",pid=555,fd=6))           
+
+видим, что angie слушает по UDP 443, значит http3 работает.
+

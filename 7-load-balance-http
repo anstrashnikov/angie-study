@@ -1,0 +1,165 @@
+Для лабораторной используем angie на хостовой ОС и 4 бекенда, предоставленных по материалам от преподавателя.
+
+docker compose ps
+WARN[0000] /home/user01/dz7/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion 
+NAME          IMAGE                 COMMAND                  SERVICE       CREATED      STATUS             PORTS
+debug-blue    vscoder/webdebugger   "gunicorn -w 1 --bin…"   debug-blue    5 days ago   Up 13 minutes      0.0.0.0:9001->8080/tcp, [::]:9001->8080/tcp
+debug-gold    vscoder/webdebugger   "gunicorn -w 1 --bin…"   debug-gold    5 days ago   Up About an hour   0.0.0.0:9003->8080/tcp, [::]:9003->8080/tcp
+debug-green   vscoder/webdebugger   "gunicorn -w 1 --bin…"   debug-green   5 days ago   Up About an hour   0.0.0.0:9002->8080/tcp, [::]:9002->8080/tcp
+debug-white   vscoder/webdebugger   "gunicorn -w 1 --bin…"   debug-white   5 days ago   Up About an hour   0.0.0.0:9000->8080/tcp, [::]:9000->8080/tcp
+
+
+
+1) Равномерная балансировка (round-robin) с отключением одного бекенда и установлнем одного бекенда как резервный.
+
+cat angie.conf
+user  angie;
+worker_processes  auto;
+worker_rlimit_nofile 65536;
+
+error_log  /var/log/angie/error.log notice;
+pid        /run/angie.pid;
+
+events {
+    worker_connections  65536;
+}
+
+
+http {
+    include       /etc/angie/mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    log_format extended '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" rt="$request_time" '
+                        '"$http_user_agent" "$http_x_forwarded_for" '
+                        'h="$host" sn="$server_name" ru="$request_uri" u="$uri" '
+                        'ucs="$upstream_cache_status" ua="$upstream_addr" us="$upstream_status" '
+                        'uct="$upstream_connect_time" urt="$upstream_response_time"';
+
+    access_log  /var/log/angie/access.log  main;
+
+    include     /etc/angie/http.d/*.conf;
+
+}
+
+cat default.conf 
+upstream backend {
+    server 127.0.0.1:9001 down;
+    server 127.0.0.1:9002 max_fails=3 fail_timeout=5s;
+    server 127.0.0.1:9003 max_fails=3 fail_timeout=5s; 
+    server 127.0.0.1:9000 backup;
+    zone wp_backend_zone 64k;
+}
+
+server {
+    listen 80;
+    # Логи запросов и ошибок
+    access_log /var/log/angie/balancer_access.log;
+    error_log /var/log/angie/balancer_error.log;
+
+    # Проксирование основного трафика на бэкенды
+    location / {
+        proxy_pass http://backend;
+
+        # Передача реальных заголовков клиента на бэкенд
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Настройки тайм-аутов для предотвращения зависания запросов
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+
+        # Перенаправлять запрос на следующий бэкенд, если текущий выдал ошибку
+        proxy_next_upstream error timeout invalid_header http_500 http_502 http_503 http_504;
+    }
+}
+
+Показывается попеременно то золотая, то зеленая страница, так как белая резервная, а голубая отключена.
+
+2) Балансировка по хэшу с использованием переменных (По URI запроса ($request_uri)).
+
+cat default.conf 
+upstream backend {
+    hash $request_uri;
+    server 127.0.0.1:9000 down;
+    server 127.0.0.1:9002 max_fails=3 fail_timeout=5s;
+    server 127.0.0.1:9003 max_fails=3 fail_timeout=5s;
+    server 127.0.0.1:9001 max_fails=3 fail_timeout=5s;
+    zone wp_backend_zone 64k;
+}
+
+server {
+    listen 80;
+    # Логи запросов и ошибок
+    access_log /var/log/angie/balancer_access.log;
+    error_log /var/log/angie/balancer_error.log;
+
+    # Проксирование основного трафика на бэкенды
+    location / {
+        proxy_pass http://backend;
+
+        # Передача реальных заголовков клиента на бэкенд
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Настройки тайм-аутов для предотвращения зависания запросов
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+
+        # Перенаправлять запрос на следующий бэкенд, если текущий выдал ошибку
+        proxy_next_upstream error timeout invalid_header http_500 http_502 http_503 http_504;
+    }
+}
+
+такой метод не поддерживает резервирование. При этом показывается всегда одна и таже страница, в моем случае голубая, так как используется хэш по URL.
+
+3) Произвольная балансировка (random).
+
+cat default.conf 
+upstream backend {
+    random;
+    server 127.0.0.1:9001 down;
+    server 127.0.0.1:9002 weight=2; #в два раза больше запросов
+    server 127.0.0.1:9003;
+    server 127.0.0.1:9000 down;
+    zone wp_backend_zone 64k;
+}
+
+server {
+    listen 80;
+    # Логи запросов и ошибок
+    access_log /var/log/angie/balancer_access.log;
+    error_log /var/log/angie/balancer_error.log;
+
+    # Проксирование основного трафика на бэкенды
+    location / {
+        proxy_pass http://backend;
+
+        # Передача реальных заголовков клиента на бэкенд
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Настройки тайм-аутов для предотвращения зависания запросов
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+
+        # Перенаправлять запрос на следующий бэкенд, если текущий выдал ошибку
+        proxy_next_upstream error timeout invalid_header http_500 http_502 http_503 http_504;
+    }
+}
+
+Зеленая страница открывается чаще в два раза.
+

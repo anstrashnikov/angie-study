@@ -1,0 +1,324 @@
+1) конфиг для поднятия докеров с двумя WP и СУБД
+
+cat docker-compose.yml 
+services:
+  # Общая база данных для обоих веб-серверов
+  db-mysql:
+    image: mysql:8.0
+    container_name: testbench-db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root_secure_pass
+      MYSQL_DATABASE: wordpress_db
+      MYSQL_USER: wp_user
+      MYSQL_PASSWORD: wp_password
+    volumes:
+      - db_data_p:/var/lib/mysql
+    networks:
+      - testbench-net
+
+  # Первый сервер-бекенд (Нода 1)
+  web-backend-1:
+    image: wordpress:latest
+    container_name: testbench-web-1
+    restart: always
+    ports:
+      - "127.0.0.1:8081:80" # Доступен только локально для хостового Angie
+    environment:
+      WORDPRESS_DB_HOST: db-mysql:3306
+      WORDPRESS_DB_USER: wp_user
+      WORDPRESS_DB_PASSWORD: wp_password
+      WORDPRESS_DB_NAME: wordpress_db
+    volumes:
+      - wp_data_p:/var/www/html # Общий volume для синхронизации медиа-файлов
+    depends_on:
+      - db-mysql
+    networks:
+      - testbench-net
+
+  # Второй сервер-бекенд (Нода 2)
+  web-backend-2:
+    image: wordpress:latest
+    container_name: testbench-web-2
+    restart: always
+    ports:
+      - "127.0.0.1:8082:80" # Доступен только локально для хостового Angie
+    environment:
+      WORDPRESS_DB_HOST: db-mysql:3306
+      WORDPRESS_DB_USER: wp_user
+      WORDPRESS_DB_PASSWORD: wp_password
+      WORDPRESS_DB_NAME: wordpress_db
+    volumes:
+      - wp_data_p:/var/www/html
+    depends_on:
+      - db-mysql
+    networks:
+      - testbench-net
+
+volumes:
+  db_data_p:
+  wp_data_p:
+
+networks:
+  testbench-net:
+    driver: bridge
+
+2) Конфиг angie
+
+cat angie.conf 
+user  angie;
+worker_processes  auto;
+worker_rlimit_nofile 65536;
+
+error_log  /var/log/angie/error.log notice;
+pid        /run/angie.pid;
+
+events {
+    worker_connections  65536;
+}
+
+
+http {
+    include       /etc/angie/mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    log_format extended '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" rt="$request_time" '
+                        '"$http_user_agent" "$http_x_forwarded_for" '
+                        'h="$host" sn="$server_name" ru="$request_uri" u="$uri" '
+                        'ucs="$upstream_cache_status" ua="$upstream_addr" us="$upstream_status" '
+                        'uct="$upstream_connect_time" urt="$upstream_response_time"';
+
+    access_log  /var/log/angie/access.log  main;
+
+    include     /etc/angie/http.d/*.conf;
+
+    # Зона для ограничения (по IP, память 10МБ, скорость 1 запрос в секунду)
+    limit_req_zone $binary_remote_addr zone=req_limit_per_ip:10m rate=1r/s;
+    
+    # Кэширование для серверной оптимизации
+    proxy_cache_path /var/cache/angie levels=1:2 keys_zone=backend_cache:10m max_size=1g inactive=60m use_temp_path=off;
+
+}
+
+
+cat default.conf 
+upstream app_backend {
+    zone upstream_backend 10m;
+    server 127.0.0.1:8081 max_fails=3 fail_timeout=10s;
+    server 127.0.0.1:8082 max_fails=3 fail_timeout=10s;
+    # Удержание постоянных соединений с бекендами, оптимизация.
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name anstrashnikov.ru; 
+    return 301 https://$host$request_uri;
+}
+
+server {
+    # Включаем стандартный HTTPS и HTTP/2
+    listen 443 ssl;
+    server_name anstrashnikov.ru;
+    http2 on;
+    
+    # Включаем HTTP/3 (QUIC) на UDP порту 443
+    listen 443 quic reuseport; 
+        
+
+    # SSL сертификаты
+    ssl_certificate /etc/angie/ssl/server.crt;
+    ssl_certificate_key /etc/angie/ssl/server.key;        
+
+     # Логирование ошибок в отдельный файл
+     error_log /var/log/angie/wordpress_error.log info;
+
+    # Включаем выбор шифров с клиента    
+    ssl_prefer_server_ciphers off;
+    
+    # Кэширование SSL-сессий (ускоряет повторные заходы клиентов)
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    # Хранение тикетов на лкиенте
+    ssl_session_tickets on;
+
+    # Клиентская оптимизация (Сжатие)
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml text/javascript;
+    gzip_comp_level 5;
+
+    # Заголовки проксирования
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    
+    # ВАЖНО для WordPress: сообщаем, что запрос пришел по HTTPS
+    proxy_set_header X-Forwarded-Proto https; 
+    
+    proxy_buffers 8 16k;
+    proxy_buffer_size 32k;     
+
+    # Правила динамического обхода кэша для WordPress
+    set $no_cache 0;
+    if ($request_method = POST) { set $no_cache 1; }
+    if ($query_string != "") { set $no_cache 1; }
+    if ($request_uri ~* "/wp-admin/|/xmlrpc.php|wp-.*.php|/feed/|index.php") { set $no_cache 1; }
+    if ($http_cookie ~* "comment_author|wordpress_[a-f0-9]+|wp-postpass|wordpress_no_cache|wordpress_logged_in") { set $no_cache 1; }    
+
+    # Корневой локейшн (Динамика + Защита)
+    location / {
+        limit_req zone=req_limit_per_ip burst=10 nodelay;
+        
+        proxy_pass http://app_backend;
+
+        # Кэширование
+        proxy_cache backend_cache;
+        proxy_cache_valid 200 302 10m;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        
+        # Применяем правила обхода кэша
+        proxy_cache_bypass $no_cache;
+        proxy_no_cache $no_cache;
+        
+        # Защита от Cache Stampede при DoS-атаках
+        proxy_cache_lock on;                
+
+        add_header X-Cache-Status $upstream_cache_status;
+    }
+
+    # Клиентская оптимизация: Кэширование статики
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
+        
+        # Высокий burst для статики
+        limit_req zone=req_limit_per_ip burst=100 nodelay;
+        
+        proxy_pass http://app_backend;
+        
+        # Серверное кэширование статики внутри Angie (Защита докера при атаках)
+        proxy_cache backend_cache;
+        proxy_cache_valid 200 302 7d;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        proxy_cache_bypass 0;
+        proxy_no_cache 0;
+
+        # Клиентское кэширование (Браузер)
+        expires 30d;
+        add_header Cache-Control "public, no-transform";
+        
+        add_header X-Cache-Status $upstream_cache_status;        
+ 
+    }
+
+    # Объединенный локейшн для всей админки, авторизации и фоновых API админки
+    location ~* ^/(wp-admin|wp-login\.php|index\.php\?rest_route=\/wp\/v2) {
+        # Доступ на панель управления только с определенного IP
+            
+        allow 192.168.122.1; # Ваш доверенный IP тестового ПК
+        deny all;            # Запрет для всех остальных
+
+        # 2. Оптимизация лимитов для админки (Защита от ложных блокировок)
+        # Повышаем burst до 50 запросов, чтобы тяжелая админка со скриптами 
+        # не вызывала у вас ошибок 503 и не триггерила Fail2Ban при обычной работе.
+        limit_req zone=req_limit_per_ip burst=50 nodelay;
+
+        # 3. Проксирование в докер-контейнеры
+        proxy_pass http://app_backend;
+    
+        
+        }
+}
+
+3) конфиг fail2ban
+
+файл /etc/fail2ban/filter.d/nginx-limit-req.conf
+
+cat /etc/fail2ban/filter.d/nginx-limit-req.conf
+# Fail2ban filter configuration for nginx :: limit_req
+# used to ban hosts, that were failed through nginx by limit request processing rate 
+#
+# Author: Serg G. Brester (sebres)
+#
+# To use 'nginx-limit-req' filter you should have `ngx_http_limit_req_module`
+# and define `limit_req` and `limit_req_zone` as described in nginx documentation
+# http://nginx.org/en/docs/http/ngx_http_limit_req_module.html
+#
+# Example:
+#
+#   http {
+#     ...
+#     limit_req_zone $binary_remote_addr zone=lr_zone:10m rate=1r/s;
+#     ...
+#     # http, server, or location:
+#     location ... {
+#       limit_req zone=lr_zone burst=1 nodelay;
+#       ...
+#     }
+#     ...
+#   }
+#   ...
+#
+
+[INCLUDES]
+
+before = nginx-error-common.conf
+
+[Definition]
+
+# Specify following expression to define exact zones, if you want to ban IPs limited 
+# from specified zones only.
+# Example:
+#
+#   ngx_limit_req_zones = lr_zone|lr_zone2
+#
+ngx_limit_req_zones = [^"]+
+
+# Depending on limit_req_log_level directive (may be: info | notice | warn | error):
+__err_type = [a-z]+
+
+# Use following full expression if you should range limit request to specified 
+# servers, requests, referrers etc. only :
+#
+# failregex = ^%(__prefix_line)slimiting requests, excess: [\d\.]+ by zone "(?:%(ngx_limit_req_zones)s)", client: <HOST>, server: \S*, request: "\S+ \S+ HTTP/\d+\.\d+", host: "\S+"(, referrer: "\S+")?\s*$
+
+# Shortly, much faster and stable version of regexp:
+failregex = ^%(__prefix_line)slimiting requests, excess: [\d\.]+ by zone "(?:%(ngx_limit_req_zones)s)", client: <HOST>,
+
+ignoreregex = 
+
+datepattern = {^LN-BEG}
+
+journalmatch = _SYSTEMD_UNIT=nginx.service + _COMM=nginx
+
+далее создаем jail:
+
+nano /etc/fail2ban/jail.d/angie-wp.conf
+
+[angie-limitreq]
+enabled = true
+port    = http,https
+filter  = nginx-limit-req
+action  = iptables-multiport[name=angie-limitreq, port="http,https", protocol=tcp]
+logpath = /var/log/angie/wordpress_error.log
+# Сколько попыток (блокировок от Angie) разрешено
+maxretry = 3
+# Окно времени, в течение которого считаются попытки (10 минут)
+findtime = 600
+# Время блокировки нарушителя (1 час)
+bantime  = 180
+
+далее рестартуем сервис
+
+systemctl restart fail2ban
+
+проверям, что jail активный
+
+fail2ban-client status
+Status
+|- Number of jail:	1
+`- Jail list:	angie-limitreq
+
